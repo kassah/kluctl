@@ -3,14 +3,22 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
+	"time"
+
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	test_utils "github.com/kluctl/kluctl/v2/e2e/test-utils"
+	port_tool "github.com/kluctl/kluctl/v2/e2e/test-utils/port-tool"
 	"github.com/kluctl/kluctl/v2/e2e/test_project"
 	"github.com/kluctl/kluctl/v2/pkg/utils/uo"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/clientcmd"
+
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -1243,4 +1251,100 @@ func TestHelmWithTarget(t *testing.T) {
 	p.KluctlMust(t, "deploy", "--yes", "-t", "test")
 
 	assertConfigMapExists(t, k, p.TestSlug(), "test-helm1-test-chart1")
+}
+
+// Reproduction test for bug where a helm post-install hooks causes kluctl to exit with
+// a "context cancelled while waiting for readiness" error when the API server connection
+// is dropped while waiting for readiness. We simulate a flaky control plane by proxying
+// the kube-apiserver and closing the proxy once the jobs have been created.
+// The jobs themselves complete successfully.
+func TestHelmPostInstallJobsContextCancelled(t *testing.T) {
+	// don't run this in parallel to other tests as timing can easily go bad
+
+	k := defaultCluster1
+
+	p := test_project.NewTestProject(t)
+
+	// prepare a kubeconfig that routes through a TCP proxy so we can tear down the
+	// connection mid-deploy
+	cfg, err := clientcmd.Load(k.Kubeconfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// determine which cluster the current context refers to
+	var clusterName string
+	clusterName = cfg.Contexts[cfg.CurrentContext].Cluster
+	if clusterName == "" {
+		t.Fatal("no cluster found in current-context")
+	}
+	origServer := cfg.Clusters[clusterName].Server
+	u, err := url.Parse(origServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendAddr, err := net.ResolveTCPAddr("tcp", u.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listener := port_tool.NewListenerWithUniquePort("127.0.0.1")
+	proxy, err := test_utils.NewTCPProxy(listener, backendAddr, test_utils.WithMaxConnDuration(2*time.Second), test_utils.WithTCPProxyLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	go proxy.Run()
+	t.Cleanup(func() { proxy.Close() })
+
+	// point kubeconfig at the proxy
+	u.Host = proxy.FrontendAddr().String()
+	cfg.Clusters[clusterName].Server = u.String()
+	newKcBytes, err := clientcmd.Write(*cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kubeconfigFile := getKubeconfigTmpFile(t, newKcBytes)
+	p.AddExtraArgs("--kubeconfig", kubeconfigFile)
+
+	createNamespace(t, k, p.TestSlug())
+
+	// Create a job with a post-install hook.
+	p.UpdateTarget("test", nil)
+	p.AddHelmDeployment("helm1", test_utils.NewHelmTestRepoLocal("test-wait-chart"), "", "", "test-helm-1", p.TestSlug(), nil)
+	chartDir := filepath.Join(p.LocalProjectDir(), "helm1/test-wait-chart")
+	test_utils.CreateHelmDir(t, "test-wait-chart", "0.1.0", chartDir)
+
+	job := `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job
+  annotations:
+    helm.sh/hook: post-install
+    helm.sh/hook-weight: "-5"
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: sleep
+        image: busybox
+        command: ["sleep", "8"]
+`
+	err = os.WriteFile(filepath.Join(chartDir, "templates", "job.yaml"), []byte(job), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		time.Sleep(8 * time.Second)
+		patchObject(t, k, schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}, p.TestSlug(), "job", func(o *uo.UnstructuredObject) {
+			o.SetK8sAnnotation("kluctl.io/is-ready", "true")
+		})
+	}()
+
+	p.KluctlMust(t, "deploy", "--yes", "-t", "test", "--timeout", (30 * time.Second).String())
+
+	assert.Greater(t, proxy.KilledCount.Load(), int64(0), "expected at least one connection to be killed by TCPProxy")
+
+	// even though the connection was flaky, the deploy should have succeeded eventually
+	assertObjectExists(t, k, schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}, p.TestSlug(), "job")
 }

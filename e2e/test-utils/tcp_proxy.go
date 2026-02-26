@@ -1,17 +1,24 @@
 package test_utils
 
 import (
+	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"syscall"
+	"testing"
+	"time"
 )
 
 // TCPProxy is a proxy for TCP connections. It implements the Proxy interface to
 // handle TCP traffic forwarding between the frontend and backend addresses.
 type TCPProxy struct {
-	listener     net.Listener
-	frontendAddr *net.TCPAddr
-	backendAddr  *net.TCPAddr
+	t               testing.TB
+	listener        net.Listener
+	frontendAddr    *net.TCPAddr
+	backendAddr     *net.TCPAddr
+	MaxConnDuration time.Duration
+	KilledCount     atomic.Int64
 }
 
 // NewTCPProxy creates a new TCPProxy.
@@ -38,6 +45,13 @@ func (proxy *TCPProxy) clientLoop(client *net.TCPConn, quit chan bool) {
 		return
 	}
 
+	var timer *time.Timer
+	var timeoutChan <-chan time.Time
+	if proxy.MaxConnDuration != 0 {
+		timer = time.NewTimer(proxy.MaxConnDuration)
+		timeoutChan = timer.C
+	}
+
 	event := make(chan int64)
 	var broker = func(to, from *net.TCPConn) {
 		written, err := io.Copy(to, from)
@@ -60,7 +74,20 @@ func (proxy *TCPProxy) clientLoop(client *net.TCPConn, quit chan bool) {
 		select {
 		case written := <-event:
 			transferred += written
+		case <-timeoutChan:
+			// Interrupt the two brokers and "join" them.
+			client.Close()
+			backend.Close()
+			for ; i < 2; i++ {
+				transferred += <-event
+			}
+			proxy.t.Log(fmt.Sprintf("TCPProxy: killed connection from %s to %s due to timeout", client.RemoteAddr(), proxy.backendAddr))
+			proxy.KilledCount.Add(1)
+			return
 		case <-quit:
+			if timer != nil {
+				timer.Stop()
+			}
 			// Interrupt the two brokers and "join" them.
 			client.Close()
 			backend.Close()
@@ -69,6 +96,9 @@ func (proxy *TCPProxy) clientLoop(client *net.TCPConn, quit chan bool) {
 			}
 			return
 		}
+	}
+	if timer != nil {
+		timer.Stop()
 	}
 	client.Close()
 	backend.Close()
@@ -95,3 +125,15 @@ func (proxy *TCPProxy) FrontendAddr() net.Addr { return proxy.frontendAddr }
 
 // BackendAddr returns the TCP proxied address.
 func (proxy *TCPProxy) BackendAddr() net.Addr { return proxy.backendAddr }
+
+func WithMaxConnDuration(duration time.Duration) func(*TCPProxy) {
+	return func(proxy *TCPProxy) {
+		proxy.MaxConnDuration = duration
+	}
+}
+
+func WithTCPProxyLogger(t testing.TB) func(*TCPProxy) {
+	return func(proxy *TCPProxy) {
+		proxy.t = t
+	}
+}

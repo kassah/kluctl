@@ -110,6 +110,10 @@ test-e2e-non-gitops: envtest ## Run non-gitops e2e tests.
 test-e2e-gitops: envtest ## Run gitops e2e tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir=$(LOCALBIN) -p path | $(PATHCONF))" go test $(RACE) ./e2e -timeout 15m -coverprofile cover.out -test.v -run 'TestGitOps.*'
 
+.PHONY: test-e2e-single
+test-e2e-single: envtest ## Run singe e2e test.
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir=$(LOCALBIN) -p path | $(PATHCONF))" go test ./e2e -timeout 15m -test.v -run '$(TEST_NAME)'
+
 replace-commands-help: ## Replace commands help in docs
 	go run ./internal/replace-commands-help --docs-dir ./docs/kluctl/commands
 
